@@ -23,6 +23,8 @@ panic-halt = "0.2.0"
 usbd-human-interface-device = { version = "0.5.1", features = ["defmt"] }
 fugit = "0.3.7"
 
+frunk = "0.4.4"
+
 [features]
 default = ["active_high"]
 active_high = []

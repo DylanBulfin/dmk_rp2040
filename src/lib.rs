@@ -1,33 +1,46 @@
 #![no_std]
 
-use core::default;
+use core::ops::Index;
 
+use defmt::info;
 use dmk::{
-    behavior::NoArgBehavior, controller::PinSet, layer::Layer, physical_layout::MAX_KEYS,
+    controller::{ControllerLayout, PinSet},
+    layer::Layer,
+    scanning::ScanAlgorithm,
     state::State,
+    timer::{Duration, Timer},
 };
 use embedded_hal::digital::{InputPin, OutputPin};
+use frunk::{HCons, HNil};
 #[cfg(feature = "active_low")]
 use rp2040_hal::gpio::PullUp;
 #[cfg(feature = "active_high")]
-use rp2040_hal::gpio::{FunctionSio, SioInput, SioOutput};
+use rp2040_hal::gpio::{FunctionSio, SioOutput};
 use rp2040_hal::{
-    Timer,
+    Sio, Watchdog,
     gpio::{
-        DynPinId, FunctionNull, Pin, PinId, Pins, PullDown,
+        DynPinId, FunctionNull, Pin, Pins, PullDown,
         bank0::{
             Gpio0, Gpio1, Gpio2, Gpio3, Gpio4, Gpio5, Gpio6, Gpio7, Gpio8, Gpio9, Gpio10, Gpio11,
             Gpio12, Gpio13, Gpio14, Gpio15, Gpio16, Gpio17, Gpio18, Gpio19, Gpio20, Gpio21, Gpio22,
             Gpio23, Gpio24, Gpio25, Gpio26, Gpio27, Gpio28, Gpio29,
         },
     },
+    pac,
+    usb::UsbBus,
+};
+use usb_device::{
+    bus::UsbBusAllocator,
+    device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbVidPid},
+};
+use usbd_human_interface_device::{
+    UsbHidError,
+    device::keyboard::NKROBootKeyboard,
+    page::Keyboard,
+    prelude::{UsbHidClass, UsbHidClassBuilder},
 };
 
-pub struct ControllerState {
-    timer: Timer,
-}
-
-pub struct PinsWrapper {
+pub struct PinCollection {
     active_high: bool,
     pins: MaybePins,
     input_pins: [Option<Pin<DynPinId, FunctionNull, PullDown>>; 30],
@@ -329,7 +342,7 @@ macro_rules! match_pin {
         }
     };
 }
-impl PinsWrapper {
+impl PinCollection {
     pub fn init(pins: Pins, active_high: bool) -> Self {
         let pins = MaybePins::from(pins);
 
@@ -345,7 +358,7 @@ impl PinsWrapper {
     }
 }
 
-impl PinSet for PinsWrapper {
+impl PinSet for PinCollection {
     fn len(&self) -> usize {
         30
     }
@@ -395,17 +408,158 @@ impl PinSet for PinsWrapper {
     }
 }
 
-pub struct TimerWrapper<'t> {
-    timer: &'t Timer,
+pub struct TimerWrapper {
+    timer: rp2040_hal::timer::Timer,
 }
 
-impl<'t> dmk::timer::Timer for TimerWrapper<'t> {
+impl dmk::timer::Timer for TimerWrapper {
     fn microseconds(&self) -> u64 {
         self.timer.get_counter().ticks()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub struct RP2040BaseState<A>
+where
+    A: ScanAlgorithm,
+{
+    pub watchdog: Watchdog,
+    pub timer: TimerWrapper,
+    pub usb_bus: UsbBusAllocator<UsbBus>,
+    pub layout: ControllerLayout<PinCollection, A>,
 }
+
+impl<A> RP2040BaseState<A>
+where
+    A: ScanAlgorithm,
+{
+    pub fn new(xtal_freq_hz: u32, keys: usize, algorithm: A) -> Self {
+        info!("Program start");
+        let mut pac = pac::Peripherals::take().unwrap();
+        let mut watchdog = Watchdog::new(pac.WATCHDOG);
+        let sio = Sio::new(pac.SIO);
+
+        let clocks = rp2040_hal::clocks::init_clocks_and_plls(
+            xtal_freq_hz,
+            pac.XOSC,
+            pac.CLOCKS,
+            pac.PLL_SYS,
+            pac.PLL_USB,
+            &mut pac.RESETS,
+            &mut watchdog,
+        )
+        .ok()
+        .unwrap();
+
+        let timer = rp2040_hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+
+        let pins = Pins::new(
+            pac.IO_BANK0,
+            pac.PADS_BANK0,
+            sio.gpio_bank0,
+            &mut pac.RESETS,
+        );
+
+        let usb_bus = UsbBusAllocator::new(UsbBus::new(
+            pac.USBCTRL_REGS,
+            pac.USBCTRL_DPRAM,
+            clocks.usb_clock,
+            true,
+            &mut pac.RESETS,
+        ));
+
+        let pin_collection = PinCollection::init(pins, true);
+
+        let layout = ControllerLayout::new(keys, pin_collection, algorithm);
+
+        Self {
+            layout,
+            timer: TimerWrapper { timer },
+            usb_bus,
+            watchdog,
+        }
+    }
+}
+
+fn create_usb_extras(
+    usb_bus: &UsbBusAllocator<UsbBus>,
+) -> (
+    UsbHidClass<'_, UsbBus, HCons<NKROBootKeyboard<'_, UsbBus>, HNil>>,
+    UsbDevice<'_, UsbBus>,
+) {
+    (
+        UsbHidClassBuilder::new()
+            .add_device(
+                usbd_human_interface_device::device::keyboard::NKROBootKeyboardConfig::default(),
+            )
+            .build(usb_bus),
+        UsbDeviceBuilder::new(usb_bus, UsbVidPid(0x1209, 0x0001))
+            .strings(&[StringDescriptors::default()
+                .manufacturer("Dylan Bulfin")
+                .product("Boot keyboard")
+                .serial_number("TEST")])
+            .unwrap()
+            .build(),
+    )
+}
+
+pub fn main_loop<A, C>(rp_state: RP2040BaseState<A>, layers: C)
+where
+    A: ScanAlgorithm,
+    C: Index<usize, Output = Layer>,
+{
+    let RP2040BaseState {
+        timer,
+        usb_bus,
+        layout,
+        watchdog,
+    } = rp_state;
+    let (mut keyboard, mut usb_device) = create_usb_extras(&usb_bus);
+
+    let mut kb_state = State::new(layers, layout, timer);
+
+    let mut next_tick = kb_state.timer_state.timer.as_instant();
+    let mut next_scan = kb_state.timer_state.timer.as_instant();
+
+    loop {
+        if next_tick <= kb_state.timer_state.timer.as_instant() {
+            match keyboard.tick() {
+                Err(UsbHidError::WouldBlock) | Ok(_) => {}
+                Err(e) => core::panic!("Failed to process keyboard tick: {:?}", e),
+            }
+
+            watchdog.feed();
+
+            next_tick = kb_state
+                .timer_state
+                .timer
+                .add_duration(Duration::from_millis(1));
+        }
+
+        if usb_device.poll(&mut [&mut keyboard]) {
+            keyboard.device().read_report();
+        }
+
+        if next_scan <= kb_state.timer_state.timer.as_instant() {
+            let keys = [Keyboard::Z; 1];
+
+            match keyboard.device().write_report(keys) {
+                Err(UsbHidError::WouldBlock) => {}
+                Err(UsbHidError::Duplicate) => {}
+                Ok(_) => {}
+                Err(e) => {
+                    core::panic!("Failed to write keyboard report: {:?}", e)
+                }
+            }
+
+            next_scan = kb_state
+                .timer_state
+                .timer
+                .add_duration(Duration::from_millis(10));
+        }
+
+        kb_state.main_iteration();
+    }
+}
+
+#[cfg(test)]
+mod tests {}
