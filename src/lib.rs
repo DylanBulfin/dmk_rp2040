@@ -515,13 +515,13 @@ where
     } = rp_state;
     let (mut keyboard, mut usb_device) = create_usb_extras(&usb_bus);
 
-    let mut kb_state = State::new(layers, layout, timer);
+    // let mut kb_state = State::new(layers, layout, timer);
 
-    let mut next_tick = kb_state.timer_state.timer.as_instant();
-    let mut next_scan = kb_state.timer_state.timer.as_instant();
+    let mut next_tick = timer.as_instant();
+    let mut next_scan = timer.as_instant();
 
     loop {
-        if next_tick <= kb_state.timer_state.timer.as_instant() {
+        if next_tick <= timer.as_instant() {
             match keyboard.tick() {
                 Err(UsbHidError::WouldBlock) | Ok(_) => {}
                 Err(e) => core::panic!("Failed to process keyboard tick: {:?}", e),
@@ -529,17 +529,14 @@ where
 
             watchdog.feed();
 
-            next_tick = kb_state
-                .timer_state
-                .timer
-                .add_duration(Duration::from_millis(1));
+            next_tick = timer.add_duration(Duration::from_millis(1));
         }
 
         if usb_device.poll(&mut [&mut keyboard]) {
             keyboard.device().read_report();
         }
 
-        if next_scan <= kb_state.timer_state.timer.as_instant() {
+        if next_scan <= timer.as_instant() {
             let keys = [Keyboard::Z; 1];
 
             match keyboard.device().write_report(keys) {
@@ -551,13 +548,10 @@ where
                 }
             }
 
-            next_scan = kb_state
-                .timer_state
-                .timer
-                .add_duration(Duration::from_millis(10));
+            next_scan = timer.add_duration(Duration::from_millis(10));
         }
 
-        kb_state.main_iteration();
+        // kb_state.main_iteration();
     }
 }
 
