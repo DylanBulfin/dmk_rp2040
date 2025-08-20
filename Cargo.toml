@@ -22,8 +22,7 @@ usb-device = "0.3.1"
 panic-halt = "0.2.0"
 usbd-human-interface-device = { version = "0.5.1", features = ["defmt"] }
 fugit = "0.3.7"
-
-frunk = "0.4.4"
+frunk = { version = "0.4.4", default-features = false, features = ["proc-macros"] }
 
 [features]
 default = ["active_high"]

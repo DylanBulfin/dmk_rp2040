@@ -502,7 +502,7 @@ fn create_usb_extras(
     )
 }
 
-pub fn main_loop<A, C>(rp_state: RP2040BaseState<A>, layers: C)
+pub fn main_loop<A, C>(rp_state: RP2040BaseState<A>, layers: C) -> !
 where
     A: ScanAlgorithm,
     C: Index<usize, Output = Layer>,
